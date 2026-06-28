@@ -52,8 +52,17 @@ const plans = planRefs.map((ref) => {
 
 const serviceAreas = index.groups.map((g) => g.area);
 
+// "Last updated" is stamped automatically at BUILD time (this script runs on every deploy and on
+// the weekly cron's refresh), so the date always reflects the latest data refresh rather than a
+// stale hand-edited value. We take the most recent of the build date and the Health Net dataset's
+// own refresh date so the label never lags the in-network data.
+const buildDate = new Date().toISOString().slice(0, 10);
+let hnGenerated = "";
+try { hnGenerated = (read("healthnet-providers.json").generated || "").slice(0, 10); } catch (_) {}
+const lastUpdated = [buildDate, hnGenerated].filter(Boolean).sort().pop();
+
 const bundle = {
- meta: { lastUpdated: meta.lastUpdated, region: index.region, county: meta.county, h1Note: meta.h1Note || "" },
+ meta: { lastUpdated, region: index.region, county: meta.county, h1Note: meta.h1Note || "" },
  categories: meta.categories,
  serviceAreas,
  plans,

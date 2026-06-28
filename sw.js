@@ -4,7 +4,7 @@
    only when offline. Other same-origin static (icons/images) and cross-origin assets
    (fonts, Leaflet, tiles) are cache-first. The dynamic /api/ endpoints are always
    network with graceful offline JSON. */
-var CACHE = "amla-v44";
+var CACHE = "amla-v45";
 var CORE = ["./", "./index.html", "./css/styles.css", "./js/app.js", "./js/data.js", "./manifest.webmanifest", "./icon.svg"];
 
 self.addEventListener("install", function (e) {
