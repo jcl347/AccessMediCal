@@ -189,7 +189,7 @@
  // Recalculate the map for the newly selected plan (its in-network directory differs) and
  // move the user to the map so they see the updated in-network results. Reset the previous
  // plan's specialty selection + data-driven chips (the next search repopulates them).
- geo.specialty = ""; geo.lastSpecialties = []; geo.language = ""; geo.lastLanguages = [];
+ geo.specialty = DEFAULT_SPECIALTY; geo.specTouched = false; geo.lastSpecialties = []; geo.specFacetsKnown = false; geo.language = ""; geo.lastLanguages = [];
  renderFilters();
  if (window.L) { if (geo.iso && geo.iso.mode) applyIso(); else runSearch(); }
  var dest = document.getElementById("near-me") || document.getElementById("needs-step");
@@ -771,7 +771,13 @@
  { key: "doctor", label: "Doctors", icon: "plusCircle" },
  ];
  var RADII = [{ m: 1609, label: "1 mi" }, { m: 4828, label: "3 mi" }, { m: 8047, label: "5 mi" }, { m: 16093, label: "10 mi" }, { m: 24140, label: "15 mi" }];
- var geo = { center: { lat: 34.0522, lng: -118.2437 }, label: "Los Angeles, CA", care: "doctor", specialty: "", language: "", radius: 8047, map: null, layer: null, t: 0, shared: false, lastRefreshed: "", lastSpecialties: [], lastLanguages: [], iso: { mode: "drive", minutes: 30, fc: null, layer: null, radius: null, prof: "" } };
+ // The map opens on primary care rather than the plan's entire roster. An unfiltered roster spends
+ // the result cap across every specialty at once, so any one kind of doctor came back thin - and
+ // primary care is what a new member is nearly always looking for first. `specTouched` tracks
+ // whether the member has picked a specialty themselves: until they do, this is only a PREFERENCE
+ // (?prefer=1), and a plan whose directory has no Family Medicine falls back to its full roster.
+ var DEFAULT_SPECIALTY = "Family Medicine";
+ var geo = { center: { lat: 34.0522, lng: -118.2437 }, label: "Los Angeles, CA", care: "doctor", specialty: DEFAULT_SPECIALTY, specTouched: false, specFacetsKnown: false, language: "", radius: 8047, map: null, layer: null, t: 0, shared: false, lastRefreshed: "", lastSpecialties: [], lastLanguages: [], iso: { mode: "drive", minutes: 30, fc: null, layer: null, radius: null, prof: "" } };
  var ISO_MODES = [{ k: "walk", label: "On foot" }, { k: "bike", label: "By bike" }, { k: "drive", label: "Driving" }];
  var ISO_MINS = [10, 20, 30];
  function isoModeLabel() { var m = ISO_MODES.filter(function (x) { return x.k === geo.iso.mode; })[0]; return m ? m.label.toLowerCase() : ""; }
@@ -824,24 +830,26 @@
  if (row) {
  row.innerHTML = "";
  CARE_TYPES.forEach(function (c) {
- if (inNet && c.key === "doctor") return; // replaced by "All in-network doctors" in the specialty group
+ // Specialty chips replace the plain "Doctors" chip for in-network plans - but only once we know
+ // this plan HAS specialty facets. A directory with no usable specialties would otherwise leave no
+ // way into a doctor search at all. Hidden until the first search answers, so it doesn't flicker.
+ if (inNet && c.key === "doctor" && (!geo.specFacetsKnown || (geo.lastSpecialties || []).length)) return;
  var on = geo.care === c.key && !geo.specialty;
  var chip = el("button", { class: "chip", type: "button", "aria-pressed": on ? "true" : "false", html: svg(c.icon) + "<span>" + c.label + "</span>" });
  chip.addEventListener("click", function () { geo.care = c.key; geo.specialty = ""; renderFilters(); runSearch(); });
  row.appendChild(chip);
  });
  if (inNet) {
- // "All in-network doctors" - no specialty filter, the plan's full roster.
- var allOn = geo.care === "doctor" && !geo.specialty;
- var allChip = el("button", { class: "chip chip-spec", type: "button", "aria-pressed": allOn ? "true" : "false", html: svg("check") + "<span>All in-network doctors</span>" });
- allChip.addEventListener("click", function () { geo.specialty = ""; geo.care = "doctor"; renderFilters(); runSearch(); });
- row.appendChild(allChip);
  // Specialty chips straight from THIS plan's directory data (faceted server-side). No hardcoded
  // menu - different plans show different chips, and none appear if the data has no clear specialties.
+ // There is deliberately no "all doctors" chip: one specialty at a time is what lets the result cap
+ // fill the map with providers a member can actually use, instead of a thin sample of everything.
  (geo.lastSpecialties || []).forEach(function (f) {
  var on = geo.specialty.toLowerCase() === String(f.label).toLowerCase();
  var chip = el("button", { class: "chip chip-spec", type: "button", "aria-pressed": on ? "true" : "false", html: svg("plusCircle") + "<span>" + escapeHtml(f.label) + (f.count ? ' <span class="chip-count">' + f.count + "</span>" : "") + "</span>" });
- chip.addEventListener("click", function () { geo.specialty = on ? "" : f.label; if (!on) geo.care = "doctor"; renderFilters(); runSearch(); });
+ // Selecting is one-way - clicking the active chip keeps it, since there's no roster-wide mode
+ // to fall back to. Members switch specialties by picking a different chip.
+ chip.addEventListener("click", function () { if (on) return; geo.specialty = f.label; geo.specTouched = true; geo.care = "doctor"; renderFilters(); runSearch(); });
  row.appendChild(chip);
  });
  }
@@ -1020,7 +1028,9 @@
  var any = false;
  if (p.plan && DATA.plans.some(function (x) { return x.id === p.plan; })) { state.planId = p.plan; any = true; }
  if (p.cat) { state.category = p.cat; any = true; }
- if (p.care) { geo.care = p.care; any = true; }
+ // A shared link to a care type (pharmacy, ER...) is a place search - the default specialty would
+ // turn it back into a doctor search, so drop it. Only "doctor" links keep a specialty.
+ if (p.care) { geo.care = p.care; if (p.care !== "doctor") geo.specialty = ""; any = true; }
  if (p.radius) { var rr = parseInt(p.radius, 10); if (rr) geo.radius = Math.min(Math.max(rr, 500), 24140); any = true; }
  if (p.lat && p.lng) { var la = parseFloat(p.lat), lo = parseFloat(p.lng); if (isFinite(la) && isFinite(lo)) { geo.center = { lat: la, lng: lo }; geo.label = p.addr || "shared location"; geo.shared = true; any = true; } }
  if (p.mode) { geo.iso.mode = p.mode; geo.iso.minutes = parseInt(p.min, 10) || 20; any = true; }
@@ -1104,7 +1114,11 @@
  p._mlng = p.lng + (rad * Math.sin(ang)) / cosLat;
  });
  });
- places.forEach(function (p) {
+ // Draw out-of-network pins FIRST so the in-network ones land on top of them naturally. (This
+ // used to be a bringToFront() per green pin, which is fine for a handful and wasteful once a
+ // search returns several hundred - drawing in order costs nothing.)
+ var drawOrder = places.slice().sort(function (a, b) { return (a.inNetwork ? 1 : 0) - (b.inNetwork ? 1 : 0); });
+ drawOrder.forEach(function (p) {
  var isNet = !!p.inNetwork;
  var net = isNet ? '<br><span style="color:#2f7d52;font-weight:700">In-network with your plan</span>' : (hasPlan ? '<br><span style="color:#8a6d00;font-weight:600">Not in your plan\'s directory - confirm coverage</span>' : "");
  var spec = p.specialty ? "<br><em>" + escapeHtml(p.specialty) + "</em>" : "";
@@ -1114,9 +1128,8 @@
  var approx = p.approxByZip ? '<br><span style="color:#8a6d00">Approximate (ZIP-area) location - call to confirm address</span>' : "";
  var pop = "<strong>" + escapeHtml(p.name) + "</strong>" + spec + net + npx + lng2 + ipa2 + "<br>" + escapeHtml(p.address || "") + approx + "<br>" + p.dist.toFixed(1) + " mi away" + (p.phone ? '<br><a href="' + telHref(p.phone) + '">Call ' + escapeHtml(p.phone) + "</a>" : "") + '<br><a target="_blank" rel="noopener" href="' + dirUrl(p.lat, p.lng, "driving") + '">Directions</a>';
  // In-network dots are bigger and bolder so they stand out from the smaller, muted
- // out-of-network (public map) pins - and brought to the front so green is never hidden.
- var mk = L.circleMarker([p._mlat, p._mlng], { radius: isNet ? 8 : 5, color: "#fff", weight: isNet ? 2.5 : 1.5, fillColor: isNet ? "#2f9e63" : "#0b66d6", fillOpacity: isNet ? 1 : .8 }).addTo(geo.layer).bindPopup(pop);
- if (isNet && mk.bringToFront) mk.bringToFront();
+ // out-of-network (public map) pins - and drawn last (see drawOrder) so green is never hidden.
+ L.circleMarker([p._mlat, p._mlng], { radius: isNet ? 8 : 5, color: "#fff", weight: isNet ? 2.5 : 1.5, fillColor: isNet ? "#2f9e63" : "#0b66d6", fillOpacity: isNet ? 1 : .8 }).addTo(geo.layer).bindPopup(pop);
  });
  // Expand the view so EVERY result is visible, plus the reachable area / search ring.
  if (places.length) {
@@ -1154,10 +1167,10 @@
  var pid = state.planId;
  if (!pid || inNetworkIds().indexOf(pid) < 0) return Promise.resolve(null);
  var ai = $("#addrInput"); var z = ai && /^\d{5}$/.test((ai.value || "").trim()) ? ai.value.trim() : "";
- var furl = "/api/innetwork?plan=" + encodeURIComponent(pid) + "&lat=" + geo.center.lat + "&lng=" + geo.center.lng + "&type=" + encodeURIComponent(geo.care) + "&radius=" + effRadius + (geo.specialty ? "&specialty=" + encodeURIComponent(geo.specialty) : "") + (geo.language ? "&language=" + encodeURIComponent(geo.language) : "") + (z ? "&zip=" + z : "") + isoQ;
+ var furl = "/api/innetwork?plan=" + encodeURIComponent(pid) + "&lat=" + geo.center.lat + "&lng=" + geo.center.lng + "&type=" + encodeURIComponent(geo.care) + "&radius=" + effRadius + (geo.specialty ? "&specialty=" + encodeURIComponent(geo.specialty) : "") + (geo.language ? "&language=" + encodeURIComponent(geo.language) : "") + (z ? "&zip=" + z : "") + isoQ + (geo.specTouched ? "" : "&prefer=1");
  return fetch(furl, { headers: { Accept: "application/json" } }).then(function (r) { return r.json(); })
- .then(function (d) { return { places: (d && d.ok && Array.isArray(d.places)) ? d.places : [], source: (d && d.source) || "fhir", approx: !!(d && d.approxByZip), refreshed: (d && d.refreshed) || "", specUnavail: !!(d && d.specialtyUnavailable), facility: !!(d && d.facilityOnly), specialties: (d && Array.isArray(d.specialties)) ? d.specialties : [], languages: (d && Array.isArray(d.languagesAvail)) ? d.languagesAvail : [] }; })
- .catch(function () { return { places: [], source: "fhir", approx: false, refreshed: "", specUnavail: false, facility: false, specialties: [], languages: [] }; });
+ .then(function (d) { return { places: (d && d.ok && Array.isArray(d.places)) ? d.places : [], source: (d && d.source) || "fhir", approx: !!(d && d.approxByZip), refreshed: (d && d.refreshed) || "", specUnavail: !!(d && d.specialtyUnavailable), facility: !!(d && d.facilityOnly), specApplied: !(d && d.ok) || d.specialtyApplied !== false, specialties: (d && Array.isArray(d.specialties)) ? d.specialties : [], languages: (d && Array.isArray(d.languagesAvail)) ? d.languagesAvail : [] }; })
+ .catch(function () { return { places: [], source: "fhir", approx: false, refreshed: "", specUnavail: false, facility: false, specApplied: true, specialties: [], languages: [] }; });
  }
  function normName(s) { return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, ""); }
  // Closed network (Kaiser): no usable public FHIR. A member's in-network facilities are exactly
@@ -1214,7 +1227,10 @@
  });
  }
  f.places.forEach(function (p) { p.inNetwork = true; });
- geo.lastSource = f.source; geo.lastApprox = f.approx; geo.lastRefreshed = f.refreshed; geo.lastSpecUnavail = f.specUnavail; geo.lastFacility = f.facility; geo.lastSpecialties = f.specialties || []; geo.lastLanguages = f.languages || [];
+ // This plan's directory doesn't carry the default specialty, so the server returned its full
+ // roster instead. Drop the selection so the chips match what's actually on the map.
+ if (!f.specApplied && !geo.specTouched) geo.specialty = "";
+ geo.lastSource = f.source; geo.lastApprox = f.approx; geo.lastRefreshed = f.refreshed; geo.lastSpecUnavail = f.specUnavail; geo.lastFacility = f.facility; geo.lastSpecialties = f.specialties || []; geo.lastLanguages = f.languages || []; geo.specFacetsKnown = true;
  // Kaiser is a closed network - out-of-network places aren't meaningful, so show only its facilities.
  if (f.facility) return f.places;
  // Otherwise merge in nearby public (out-of-network / unverified) places, dropping any whose

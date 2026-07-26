@@ -56,9 +56,12 @@ function withinReach(prof, radius, lat, lng, pLat, pLng) {
   return d <= reachAt(prof, radius, bearingDeg(lat, lng, pLat, pLng)) * 1.1 + 400;
 }
 
-// How many places to return. A reachable area 20-30 mi across needs a bigger cap than an 5-mi
-// ring, or spreading the results just thins out the middle instead of filling the edges.
-function placeCap(radius) { return radius > 24000 ? 500 : radius > 12000 ? 350 : 250; }
+// How many places to return. A reachable area 20-30 mi across needs a bigger cap than a 5-mi
+// ring, or spreading the results just thins out the middle instead of filling the edges. These
+// are deliberately generous - a 30-min drive around L.A. has ~800 family-medicine providers alone,
+// and anything less than that still reads as sparse on the map. The slimmed wire format (see
+// slim() in innetwork.js) is what keeps the response affordable at this size.
+function placeCap(radius) { return radius > 24000 ? 1200 : radius > 12000 ? 800 : 500; }
 
 /* Trim `list` to `cap` items while keeping the WHOLE search area covered.
  *

@@ -98,6 +98,18 @@ function capped(list, lat, lng, radius) {
   out.sort(function (a, b) { return distM(lat, lng, a.lat, a.lng) - distM(lat, lng, b.lat, b.lng); });
   return out;
 }
+// Wire format for a place. The caps above run to four figures on a big reachable area, so only
+// send what the map actually draws: npi and website are server-side only (NPPES lookups / never
+// rendered), inNetwork is re-stamped by the client, and every other field is dropped when empty.
+// That's roughly a third off the response for free.
+var OPTIONAL = ["specialty", "phone", "address", "ipa", "newPatients", "approxByZip"];
+function round6(n) { return Math.round(n * 1e6) / 1e6; } // ~10 cm - the rest is geocoder noise
+function slim(p) {
+  var o = { name: p.name, lat: round6(p.lat), lng: round6(p.lng) };
+  OPTIONAL.forEach(function (k) { if (p[k]) o[k] = p[k]; });
+  if (p.languages && p.languages.length) o.languages = p.languages;
+  return o;
+}
 // Coordinates for a Location: prefer real FHIR position, else the ZIP centroid (approx).
 function coordsFor(res) {
   var a = res && res.address;
@@ -460,7 +472,19 @@ async function locationSearch(base, geoMode, lat, lng, km, radius, type, zip, de
   return { ok: true, mode: "locations", type: type, radius: radius, approxByZip: picked.some(function (p) { return p.approxByZip; }), count: out.length, returned: picked.length, places: picked, query: debug ? [lb.url] : undefined };
 }
 
-async function providerSearch(base, geoMode, lat, lng, km, radius, specialty, language, zip, debug, prof) {
+// The client opens on a default specialty rather than the whole roster. `prefer` says that
+// specialty is the DEFAULT, not the member's own pick: apply it only if this plan's directory
+// actually has it, otherwise fall back to the full roster so the map is never empty just because
+// a plan writes its specialties differently. An explicitly chosen specialty is always strict.
+function applyPreferred(all, specialty, language, prefer) {
+  var matched = all.filter(function (p) { return specSelected(p.specialty, specialty) && langSelected(p.languages, language); });
+  if (specialty && prefer && !matched.length) {
+    return { list: all.filter(function (p) { return langSelected(p.languages, language); }), applied: false };
+  }
+  return { list: matched, applied: !!specialty };
+}
+
+async function providerSearch(base, geoMode, lat, lng, km, radius, specialty, language, zip, debug, prof, prefer) {
   var inc = "&_include=PractitionerRole:practitioner&_include=PractitionerRole:location&_include=PractitionerRole:organization";
   var queries = [], idx = {}, roles = [];
   var truncated = false;
@@ -533,15 +557,15 @@ async function providerSearch(base, geoMode, lat, lng, km, radius, specialty, la
   all.sort(function (a, b) { return distM(lat, lng, a.lat, a.lng) - distM(lat, lng, b.lat, b.lng); });
   var specialties = facetSpecialties(all);               // data-driven specialty chips for THIS plan
   var languagesAvail = facetLanguages(all);              // data-driven language chips for THIS plan
-  var matched = all.filter(function (p) { return specSelected(p.specialty, specialty) && langSelected(p.languages, language); });
-  var out = capped(matched, lat, lng, radius);
-  return { ok: true, mode: "providers", specialty: specialty, language: language, specialties: specialties, languagesAvail: languagesAvail, approxByZip: out.some(function (p) { return p.approxByZip; }), count: matched.length, returned: out.length, uniqueProviders: all.length, rolesScanned: roles.length, truncated: truncated, places: out, query: debug ? queries : undefined };
+  var sel = applyPreferred(all, specialty, language, prefer);
+  var out = capped(sel.list, lat, lng, radius);
+  return { ok: true, mode: "providers", specialty: specialty, specialtyApplied: sel.applied, language: language, specialties: specialties, languagesAvail: languagesAvail, approxByZip: out.some(function (p) { return p.approxByZip; }), count: sel.list.length, returned: out.length, uniqueProviders: all.length, rolesScanned: roles.length, truncated: truncated, places: out, query: debug ? queries : undefined };
 }
 
 // Serve a preprocessed JSON dataset (Health Net's directory, or Kaiser's facilities).
 // ds.facilityOnly (Kaiser, a closed network): members get all care at these facilities, so
 // specialty/care-type filtering doesn't apply - return the nearest facilities for any search.
-function datasetSearch(ds, lat, lng, radius, type, specialty, language, prof) {
+function datasetSearch(ds, lat, lng, radius, type, specialty, language, prof, prefer) {
   if (!ds || !Array.isArray(ds.records)) return { ok: false, reason: "no-dataset" };
   var facilityOnly = !!ds.facilityOnly;
   // Doctor/specialty search (provider records) vs a specific care-type (place) search.
@@ -570,9 +594,9 @@ function datasetSearch(ds, lat, lng, radius, type, specialty, language, prof) {
   // roster), and the selected ones filter the same way as the FHIR path.
   var specialties = wantDoctors ? facetSpecialties(cand) : [];
   var languagesAvail = wantDoctors ? facetLanguages(cand) : [];
-  var matched = wantDoctors ? cand.filter(function (p) { return specSelected(p.specialty, specialty) && langSelected(p.languages, language); }) : cand;
-  var out = capped(matched, lat, lng, radius);
-  return { ok: true, mode: facilityOnly ? "facilities" : (wantDoctors ? "providers" : "locations"), source: ds.plan === "kaiser" ? "kaiser" : "healthnet", facilityOnly: facilityOnly, specialties: specialties, languagesAvail: languagesAvail, approxByZip: !facilityOnly, refreshed: ds.generated || "", type: type, specialty: specialty, language: language, count: matched.length, returned: out.length, places: out };
+  var sel = wantDoctors ? applyPreferred(cand, specialty, language, prefer) : { list: cand, applied: false };
+  var out = capped(sel.list, lat, lng, radius);
+  return { ok: true, mode: facilityOnly ? "facilities" : (wantDoctors ? "providers" : "locations"), source: ds.plan === "kaiser" ? "kaiser" : "healthnet", facilityOnly: facilityOnly, specialties: specialties, languagesAvail: languagesAvail, approxByZip: !facilityOnly, refreshed: ds.generated || "", type: type, specialty: specialty, specialtyApplied: sel.applied, language: language, count: sel.list.length, returned: out.length, places: out };
 }
 
 module.exports = async function handler(req, res) {
@@ -590,6 +614,7 @@ module.exports = async function handler(req, res) {
   // Optional radial profile of the client's reachable-area polygon (see api/_reach.js): searching
   // the real travel-time shape instead of the circle around it is what fills in the far edges.
   var prof = REACH.parseProfile(q.iso);
+  var prefer = String(q.prefer || "") === "1"; // the specialty is the app's default, not the member's pick
   if (!isFinite(lat) || !isFinite(lng)) { res.status(400).json({ ok: false, error: "Missing coordinates" }); return; }
 
   var cfg = (ENDPOINTS.plans || {})[plan];
@@ -598,7 +623,7 @@ module.exports = async function handler(req, res) {
   try {
     var result;
     if (cfg.dataset) {
-      result = datasetSearch(HN, lat, lng, radius, type, specialty, language, prof);
+      result = datasetSearch(HN, lat, lng, radius, type, specialty, language, prof, prefer);
       result = Object.assign({ plan: plan }, result);
     } else {
       var base = String(cfg.baseUrl).replace(/\/+$/, "");
@@ -607,7 +632,7 @@ module.exports = async function handler(req, res) {
       // "Doctors" (type=doctor) uses provider mode with no specialty filter so EVERY in-network
       // doctor is returned and flagged - not just facility records (location mode = clinics).
       var wantProviders = !!(specialty || language || type === "doctor");
-      var r0 = wantProviders ? await providerSearch(base, geoMode, lat, lng, km, radius, specialty, language, zip, debug, prof)
+      var r0 = wantProviders ? await providerSearch(base, geoMode, lat, lng, km, radius, specialty, language, zip, debug, prof, prefer)
                              : await locationSearch(base, geoMode, lat, lng, km, radius, type, zip, debug, prof);
       // If provider/specialty mode returned nothing (some directories - IEHP, Molina - can't
       // filter PractitionerRole by location via the API), fall back to in-network LOCATIONS so
@@ -625,7 +650,7 @@ module.exports = async function handler(req, res) {
       try { await censusGeocode(result.places); } catch (e) { /* keep ZIP-centroid coords */ }
       result.approxByZip = result.places.some(function (p) { return p.approxByZip; });
       result.geocoded = result.places.filter(function (p) { return !p.approxByZip; }).length;
-      result.places.forEach(function (p) { delete p._addr; });
+      result.places = result.places.map(slim);
     }
     if (result.ok) res.setHeader("Cache-Control", "public, s-maxage=86400, stale-while-revalidate=604800");
     res.status(200).json(result);
