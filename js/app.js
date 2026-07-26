@@ -771,7 +771,7 @@
  { key: "doctor", label: "Doctors", icon: "plusCircle" },
  ];
  var RADII = [{ m: 1609, label: "1 mi" }, { m: 4828, label: "3 mi" }, { m: 8047, label: "5 mi" }, { m: 16093, label: "10 mi" }, { m: 24140, label: "15 mi" }];
- var geo = { center: { lat: 34.0522, lng: -118.2437 }, label: "Los Angeles, CA", care: "doctor", specialty: "", language: "", radius: 8047, map: null, layer: null, t: 0, shared: false, lastRefreshed: "", lastSpecialties: [], lastLanguages: [], iso: { mode: "drive", minutes: 30, fc: null, layer: null, radius: null } };
+ var geo = { center: { lat: 34.0522, lng: -118.2437 }, label: "Los Angeles, CA", care: "doctor", specialty: "", language: "", radius: 8047, map: null, layer: null, t: 0, shared: false, lastRefreshed: "", lastSpecialties: [], lastLanguages: [], iso: { mode: "drive", minutes: 30, fc: null, layer: null, radius: null, prof: "" } };
  var ISO_MODES = [{ k: "walk", label: "On foot" }, { k: "bike", label: "By bike" }, { k: "drive", label: "Driving" }];
  var ISO_MINS = [10, 20, 30];
  function isoModeLabel() { var m = ISO_MODES.filter(function (x) { return x.k === geo.iso.mode; })[0]; return m ? m.label.toLowerCase() : ""; }
@@ -913,6 +913,39 @@
  (fc.features || []).forEach(function (f) { if (f.geometry) scan(f.geometry.coordinates); });
  return max;
  }
+ // A compact radial "reach profile" of the reachable-area polygon: how far it extends, in metres,
+ // in each of 24 bearing sectors. We send this to the search APIs (?iso=...) so they can look for
+ // providers across the ACTUAL travel-time shape instead of the circle that circumscribes it.
+ // Without it they only knew the circle, kept the nearest N results, and so filled the middle of
+ // the map and left the edges of the reachable area empty.
+ var ISO_SECTORS = 24;
+ function bearingSector(c, lat, lng) {
+ var toRad = Math.PI / 180;
+ var y = Math.sin((lng - c.lng) * toRad) * Math.cos(lat * toRad);
+ var x = Math.cos(c.lat * toRad) * Math.sin(lat * toRad) - Math.sin(c.lat * toRad) * Math.cos(lat * toRad) * Math.cos((lng - c.lng) * toRad);
+ var brg = (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+ return Math.min(ISO_SECTORS - 1, Math.floor(brg / (360 / ISO_SECTORS)));
+ }
+ function isoProfile(fc, c) {
+ if (!fc || !fc.features) return "";
+ var prof = []; for (var i = 0; i < ISO_SECTORS; i++) prof.push(0);
+ function scan(coords) {
+ for (var j = 0; j < coords.length; j++) {
+ var p = coords[j];
+ if (typeof p[0] === "number") {
+ var d = haversineMi(c, { lat: p[1], lng: p[0] }) * 1609.34;
+ var s = bearingSector(c, p[1], p[0]);
+ if (d > prof[s]) prof[s] = d;
+ } else scan(p);
+ }
+ }
+ (fc.features || []).forEach(function (f) { if (f.geometry) scan(f.geometry.coordinates); });
+ // A polygon edge can sweep across a sector without leaving a vertex in it, so widen each sector
+ // to its neighbours' reach. Over-reaching is safe: the exact point-in-polygon test still runs here.
+ return prof.map(function (v, k) {
+ return Math.round(Math.max(v, prof[(k + ISO_SECTORS - 1) % ISO_SECTORS], prof[(k + 1) % ISO_SECTORS]));
+ }).join(",");
+ }
  function pointInRing(x, y, ring) {
  var inside = false;
  for (var i = 0, j = ring.length - 1; i < ring.length; j = i++) {
@@ -940,7 +973,7 @@
  var clr = $("#isoClearBtn"), lg = $("#lgIso");
  if (!geo.iso.mode) {
  if (geo.iso.layer && geo.map) geo.map.removeLayer(geo.iso.layer);
- geo.iso.layer = null; geo.iso.fc = null; geo.iso.radius = null;
+ geo.iso.layer = null; geo.iso.fc = null; geo.iso.radius = null; geo.iso.prof = "";
  if (clr) clr.hidden = true; if (lg) lg.hidden = true;
  runSearch(); return;
  }
@@ -959,6 +992,7 @@
  // Cover the FULL reachable area: radius = the polygon's farthest reach + a small buffer.
  var far = fcMaxDist(d.geojson, geo.center);
  geo.iso.radius = Math.min(Math.max(Math.ceil(far * 1609) + 600, 1609), 48000);
+ geo.iso.prof = isoProfile(d.geojson, geo.center); // so the APIs search the shape, not the circle
  try { geo.map.fitBounds(geo.iso.layer.getBounds(), { padding: [20, 20] }); } catch (e) {}
  if (clr) clr.hidden = false;
  if (lg) { lg.hidden = false; var t = $("#lgIsoText"); if (t) t.textContent = "Reachable in " + geo.iso.minutes + " min (" + isoModeLabel() + ")"; }
@@ -1029,6 +1063,8 @@
  var map = ensureMap(); if (!map) return;
  var isoOn = !!geo.iso.fc;
  var effRadius = isoOn && geo.iso.radius ? geo.iso.radius : geo.radius;
+ // Tells the APIs the shape of the reachable area so their results reach its edges, not just its middle.
+ var isoQ = (isoOn && geo.iso.prof) ? "&iso=" + encodeURIComponent(geo.iso.prof) : "";
  if (!isoOn) map.setView([geo.center.lat, geo.center.lng], geo.radius > 16000 ? 10 : geo.radius > 8000 ? 11 : 12);
  setTimeout(function () { if (geo.map) geo.map.invalidateSize(); }, 60);
  // Legend reflects the active mode: search-radius ring vs reachable area.
@@ -1118,7 +1154,7 @@
  var pid = state.planId;
  if (!pid || inNetworkIds().indexOf(pid) < 0) return Promise.resolve(null);
  var ai = $("#addrInput"); var z = ai && /^\d{5}$/.test((ai.value || "").trim()) ? ai.value.trim() : "";
- var furl = "/api/innetwork?plan=" + encodeURIComponent(pid) + "&lat=" + geo.center.lat + "&lng=" + geo.center.lng + "&type=" + encodeURIComponent(geo.care) + "&radius=" + effRadius + (geo.specialty ? "&specialty=" + encodeURIComponent(geo.specialty) : "") + (geo.language ? "&language=" + encodeURIComponent(geo.language) : "") + (z ? "&zip=" + z : "");
+ var furl = "/api/innetwork?plan=" + encodeURIComponent(pid) + "&lat=" + geo.center.lat + "&lng=" + geo.center.lng + "&type=" + encodeURIComponent(geo.care) + "&radius=" + effRadius + (geo.specialty ? "&specialty=" + encodeURIComponent(geo.specialty) : "") + (geo.language ? "&language=" + encodeURIComponent(geo.language) : "") + (z ? "&zip=" + z : "") + isoQ;
  return fetch(furl, { headers: { Accept: "application/json" } }).then(function (r) { return r.json(); })
  .then(function (d) { return { places: (d && d.ok && Array.isArray(d.places)) ? d.places : [], source: (d && d.source) || "fhir", approx: !!(d && d.approxByZip), refreshed: (d && d.refreshed) || "", specUnavail: !!(d && d.specialtyUnavailable), facility: !!(d && d.facilityOnly), specialties: (d && Array.isArray(d.specialties)) ? d.specialties : [], languages: (d && Array.isArray(d.languagesAvail)) ? d.languagesAvail : [] }; })
  .catch(function () { return { places: [], source: "fhir", approx: false, refreshed: "", specUnavail: false, facility: false, specialties: [], languages: [] }; });
@@ -1135,7 +1171,7 @@
  var keys = ['"amenity"="hospital"', '"amenity"="clinic"', '"amenity"="doctors"', '"amenity"="pharmacy"', '"healthcare"="hospital"', '"healthcare"="clinic"', '"healthcare"="centre"'];
  var bf = []; keys.forEach(function (k) { bf.push('node[' + k + ']["name"~"' + nf + '",i]'); bf.push('way[' + k + ']["name"~"' + nf + '",i]'); });
  // Reliable primary: server brand search (Google Places when keyed) + backup: direct Overpass.
- var srv = fetch("/api/nearby?brand=" + encodeURIComponent(brand) + "&lat=" + geo.center.lat + "&lng=" + geo.center.lng + "&radius=" + effRadius, { headers: { Accept: "application/json" } })
+ var srv = fetch("/api/nearby?brand=" + encodeURIComponent(brand) + "&lat=" + geo.center.lat + "&lng=" + geo.center.lng + "&radius=" + effRadius + isoQ, { headers: { Accept: "application/json" } })
  .then(function (r) { return r.json(); }).then(function (d) { return (d && d.ok && Array.isArray(d.places)) ? d.places : []; }).catch(function () { return []; });
  var direct = overpassDirect(null, effRadius, geo.center.lat, geo.center.lng, bf).catch(function () { return []; });
  return Promise.all([srv, direct]).then(function (res) {
@@ -1199,7 +1235,7 @@
  // For doctor/specialty searches use the richer "clinic" filter - public maps have very few
  // amenity=doctors nodes, so this surfaces real out-of-network places instead of an empty set.
  var publicCare = (geo.specialty || geo.care === "doctor") ? "clinic" : geo.care;
- var purl = "/api/nearby?lat=" + geo.center.lat + "&lng=" + geo.center.lng + "&type=" + encodeURIComponent(publicCare) + "&radius=" + effRadius;
+ var purl = "/api/nearby?lat=" + geo.center.lat + "&lng=" + geo.center.lng + "&type=" + encodeURIComponent(publicCare) + "&radius=" + effRadius + isoQ;
  var serverSource = "osm";
  var server = fetch(purl, { headers: { Accept: "application/json" } }).then(function (r) { return r.json(); })
  .then(function (d) { if (d && d.ok && Array.isArray(d.places)) { serverSource = d.source || "osm"; return d.places; } return []; })
@@ -1229,7 +1265,9 @@
  };
  function overpassDirect(type, radius, lat, lng, filtersOverride) {
  var filters = filtersOverride || CLIENT_FILTERS[type] || CLIENT_FILTERS.clinic;
- var ql = "[out:json][timeout:25];(" + filters.map(function (f) { return f + "(around:" + radius + "," + lat + "," + lng + ");"; }).join("") + ");out center tags 250;";
+ // Match the server's cap: a 250-element ceiling over a ~30 mi reachable area comes back with
+ // whole neighbourhoods missing. The reachable-area filter in process() trims it back down.
+ var ql = "[out:json][timeout:25];(" + filters.map(function (f) { return f + "(around:" + radius + "," + lat + "," + lng + ");"; }).join("") + ");out center tags " + (radius > 24000 ? 800 : radius > 12000 ? 500 : 250) + ";";
  function one(base) {
  var ctrl = new AbortController(); var t = setTimeout(function () { ctrl.abort(); }, 10000);
  return fetch(base, { method: "POST", signal: ctrl.signal, headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "data=" + encodeURIComponent(ql) })

@@ -6,6 +6,8 @@
  * Reliability: the public Overpass endpoints are often rate-limited or slow,
  * so we race SEVERAL mirrors and take the first that answers (Promise.any).
  */
+var REACH = require("./_reach");
+
 var TYPE_FILTERS = {
   pharmacy: ['node["amenity"="pharmacy"]', 'way["amenity"="pharmacy"]'],
   hospital: ['node["amenity"="hospital"]', 'way["amenity"="hospital"]'],
@@ -128,6 +130,8 @@ module.exports = async function handler(req, res) {
   var brand = String(q.brand || "").trim();
   var radius = parseInt(q.radius || "8047", 10) || 8047;
   radius = Math.min(Math.max(radius, 500), 48000); // 0.3 - ~30 mi (covers a 30-min drive isochrone)
+  // Optional radial profile of the client's reachable-area polygon (see api/_reach.js).
+  var prof = REACH.parseProfile(q.iso);
   if (!isFinite(lat) || !isFinite(lng)) { res.status(400).json({ ok: false, error: "Missing coordinates" }); return; }
 
   // Prefer Google Places when a key is configured; otherwise use OpenStreetMap/Overpass.
@@ -149,7 +153,7 @@ module.exports = async function handler(req, res) {
         googleStatus = "google-returned-0";
       } catch (e) { googleStatus = debug ? ("google-error: " + ((e && e.message) || String(e))) : "google-error"; }
     }
-    var bql = "[out:json][timeout:25];(" + brandFilters(brand).map(function (f) { return f + "(around:" + radius + "," + lat + "," + lng + ");"; }).join("") + ");out center tags 100;";
+    var bql = "[out:json][timeout:25];(" + brandFilters(brand).map(function (f) { return f + "(around:" + radius + "," + lat + "," + lng + ");"; }).join("") + ");out center tags " + (radius > 16000 ? 300 : 100) + ";";
     try {
       var bdata = await firstNonEmpty(MIRRORS.map(function (m) { return queryMirror(m, bql); }));
       var bseen = {};
@@ -161,6 +165,7 @@ module.exports = async function handler(req, res) {
         return { name: t.name || t.operator || "(Unnamed location)", lat: c.lat, lng: c.lon, phone: t.phone || t["contact:phone"] || "", address: addr, website: t.website || t["contact:website"] || "" };
       }).filter(function (x) {
         if (!isFinite(x.lat) || !isFinite(x.lng) || !brx.test(x.name)) return false;
+        if (prof && !REACH.withinReach(prof, radius, lat, lng, x.lat, x.lng)) return false;
         var k = x.name + "@" + x.lat.toFixed(4) + "," + x.lng.toFixed(4);
         if (bseen[k]) return false; bseen[k] = 1; return true;
       });
@@ -179,9 +184,13 @@ module.exports = async function handler(req, res) {
   }
 
   var filters = TYPE_FILTERS[type] || TYPE_FILTERS.clinic;
+  // A 30-min drive area is ~30 mi across; capping Overpass at 250 elements there meant whole
+  // stretches of it came back empty. Ask for more when the area is big - it's a free endpoint,
+  // and the spread cap below keeps the response size sane.
+  var outCap = radius > 24000 ? 800 : radius > 12000 ? 500 : 250;
   var ql = "[out:json][timeout:25];(" +
     filters.map(function (f) { return f + "(around:" + radius + "," + lat + "," + lng + ");"; }).join("") +
-    ");out center tags 250;";
+    ");out center tags " + outCap + ";";
 
   try {
     var data = await firstNonEmpty(MIRRORS.map(function (m) { return queryMirror(m, ql); }));
@@ -201,11 +210,15 @@ module.exports = async function handler(req, res) {
     }).filter(function (x) {
       if (!isFinite(x.lat) || !isFinite(x.lng)) return false;
       if (!isRelevant(x.name, [])) return false;
+      if (prof && !REACH.withinReach(prof, radius, lat, lng, x.lat, x.lng)) return false;
       var k = x.name + "@" + x.lat.toFixed(4) + "," + x.lng.toFixed(4);
       if (seen[k]) return false; seen[k] = 1; return true;
     });
+    // Keep the cap spread across the whole area rather than returning only the closest ones.
+    var found = places.length;
+    places = REACH.spreadCap(places, lat, lng, REACH.placeCap(radius));
     res.setHeader("Cache-Control", "public, s-maxage=86400, stale-while-revalidate=604800");
-    res.status(200).json({ ok: true, source: "osm", googleStatus: googleStatus, envKeys: envKeys, type: type, radius: radius, count: places.length, places: places });
+    res.status(200).json({ ok: true, source: "osm", googleStatus: googleStatus, envKeys: envKeys, type: type, radius: radius, count: found, returned: places.length, places: places });
   } catch (e) {
     res.status(200).json({ ok: false, source: "osm", googleStatus: googleStatus, envKeys: envKeys, error: debug ? ("overpass: " + ((e && e.message) || String(e))) : "Map search is busy right now. Please try again, or use the Google Maps link." });
   }

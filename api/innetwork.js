@@ -13,6 +13,7 @@
  *
  * Modes: locations (default) and providers (?specialty=... or ?language=...).
  */
+var REACH = require("./_reach");
 var ENDPOINTS = require("../data/fhir-endpoints.json");
 var HN = null; try { HN = require("../data/healthnet-providers.json"); } catch (e) { HN = null; }
 var ZIPC = {}; try { ZIPC = require("../data/zip-centroids.json"); } catch (e) { ZIPC = {}; }
@@ -69,24 +70,34 @@ function dropPlaceholders(list) {
   list.forEach(function (p) { var s = ((p._addr && p._addr.street) || "").toLowerCase(); if (!s) return; (byStreet[s] = byStreet[s] || {})[(p._addr && p._addr.zip) || ""] = 1; });
   return list.filter(function (p) { var s = ((p._addr && p._addr.street) || "").toLowerCase(); return !s || Object.keys(byStreet[s]).length <= 3; });
 }
-function distM(aLat, aLng, bLat, bLng) {
-  var R = 6371000, toRad = Math.PI / 180;
-  var dLat = (bLat - aLat) * toRad, dLng = (bLng - aLng) * toRad;
-  var s = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(aLat * toRad) * Math.cos(bLat * toRad) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
-  return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
-}
+var distM = REACH.distM;
 function nearParam(lat, lng, km) { return lat + "%7C" + lng + "%7C" + km.toFixed(1) + "%7Ckm"; }
 
-// ZIP codes whose centroid is within the radius, nearest first (caps the query size).
-function zipsWithin(lat, lng, radiusM, max) {
+// ZIP codes inside the search area, capped for query size. `prof` (the client's reachable-area
+// profile, when a travel-time area is active) narrows this to ZIPs actually reachable - and the
+// cap is then SPREAD across directions and distance rings instead of taking the nearest N.
+// Taking the nearest N is what emptied the edges: around downtown L.A. the closest 300 centroids
+// never get out to the ZIPs a 30-min drive really reaches.
+function zipsWithin(lat, lng, radiusM, max, prof) {
   var out = [];
-  for (var z in ZIPC) { var c = ZIPC[z]; if (!c) continue; var d = distM(lat, lng, c[0], c[1]); if (d <= radiusM) out.push([z, d]); }
-  out.sort(function (a, b) { return a[1] - b[1]; });
-  return out.slice(0, max || 40).map(function (x) { return x[0]; });
+  for (var z in ZIPC) {
+    var c = ZIPC[z]; if (!c) continue;
+    if (!REACH.withinReach(prof, radiusM, lat, lng, c[0], c[1])) continue;
+    out.push({ z: z, lat: c[0], lng: c[1], d: distM(lat, lng, c[0], c[1]) });
+  }
+  out.sort(function (a, b) { return a.d - b.d; });
+  return REACH.spreadCap(out, lat, lng, max || 40).map(function (x) { return x.z; });
 }
 // Bigger search areas (e.g. a 30-min drive isochrone) need more ZIPs so in-network
 // coverage expands to fill the reachable area rather than stopping at a small cap.
-function zipCap(radiusM) { return radiusM > 34000 ? 320 : radiusM > 24000 ? 240 : radiusM > 12000 ? 140 : 90; }
+function zipCap(radiusM) { return radiusM > 34000 ? 400 : radiusM > 24000 ? 300 : radiusM > 12000 ? 180 : 90; }
+// Trim a result list to the response cap, keeping the whole area covered (see api/_reach.js) and
+// nearest-first. Returning the nearest N is what made a 30-min drive area look like a small blob.
+function capped(list, lat, lng, radius) {
+  var out = REACH.spreadCap(list, lat, lng, REACH.placeCap(radius));
+  out.sort(function (a, b) { return distM(lat, lng, a.lat, a.lng) - distM(lat, lng, b.lat, b.lng); });
+  return out;
+}
 // Coordinates for a Location: prefer real FHIR position, else the ZIP centroid (approx).
 function coordsFor(res) {
   var a = res && res.address;
@@ -311,21 +322,33 @@ async function censusGeocode(places) {
     rows.push(i + "," + street + "," + csvCell(a.city) + "," + csvCell(a.state || "CA") + "," + csvCell(a.zip));
   });
   if (!rows.length) return;
-  var fd = new FormData();
-  fd.append("benchmark", "Public_AR_Current");
-  fd.append("addressFile", new Blob([rows.join("\n")], { type: "text/csv" }), "a.csv");
-  var ctrl = new AbortController(); var t = setTimeout(function () { ctrl.abort(); }, 8000);
-  var r = await fetch("https://geocoding.geo.census.gov/geocoder/locations/addressbatch", { method: "POST", body: fd, signal: ctrl.signal });
-  clearTimeout(t);
-  if (!r.ok) return;
-  var text = await r.text();
-  text.split(/\r?\n/).forEach(function (line) {
-    if (!line) return;
-    var f = parseCsvLine(line); var id = parseInt(f[0], 10);
-    if (!(id in map)) return;
-    if (f[2] === "Match" && f[5]) { var ll = f[5].split(","); var lo = parseFloat(ll[0]), la = parseFloat(ll[1]); if (isFinite(la) && isFinite(lo)) { var p = places[id]; if (p) { p.lat = la; p.lng = lo; p.approxByZip = false; } GEO_CACHE[map[id]] = [la, lo]; return; } }
-    GEO_CACHE[map[id]] = null;
-  });
+  // Send in parallel chunks rather than one big batch: a reachable-area search returns a few
+  // hundred places, and a single batch that size runs past the timeout - which would drop EVERY
+  // pin back to its ZIP centroid. Chunks keep each request the size the geocoder answers quickly,
+  // and one slow chunk only costs its own addresses.
+  function applyResults(text) {
+    text.split(/\r?\n/).forEach(function (line) {
+      if (!line) return;
+      var f = parseCsvLine(line); var id = parseInt(f[0], 10);
+      if (!(id in map)) return;
+      if (f[2] === "Match" && f[5]) { var ll = f[5].split(","); var lo = parseFloat(ll[0]), la = parseFloat(ll[1]); if (isFinite(la) && isFinite(lo)) { var p = places[id]; if (p) { p.lat = la; p.lng = lo; p.approxByZip = false; } GEO_CACHE[map[id]] = [la, lo]; return; } }
+      GEO_CACHE[map[id]] = null;
+    });
+  }
+  async function geocodeChunk(chunk) {
+    var fd = new FormData();
+    fd.append("benchmark", "Public_AR_Current");
+    fd.append("addressFile", new Blob([chunk.join("\n")], { type: "text/csv" }), "a.csv");
+    var ctrl = new AbortController(); var t = setTimeout(function () { ctrl.abort(); }, 8000);
+    try {
+      var r = await fetch("https://geocoding.geo.census.gov/geocoder/locations/addressbatch", { method: "POST", body: fd, signal: ctrl.signal });
+      clearTimeout(t);
+      if (r.ok) applyResults(await r.text());
+    } catch (e) { clearTimeout(t); /* this chunk keeps its ZIP-centroid pins */ }
+  }
+  var chunks = [];
+  for (var ci = 0; ci < rows.length; ci += 200) chunks.push(rows.slice(ci, ci + 200));
+  await Promise.all(chunks.map(geocodeChunk));
 }
 
 // --- real practice addresses via the free CMS NPPES NPI registry (no key) ---
@@ -379,12 +402,12 @@ function normLocation(loc) {
 }
 
 // Fetch a Location bundle by the endpoint's geo strategy.
-async function locationBundle(base, geoMode, lat, lng, km, radius, zip) {
+async function locationBundle(base, geoMode, lat, lng, km, radius, zip, prof) {
   if (geoMode === "near") {
-    var u = base + "/Location?near=" + nearParam(lat, lng, km) + "&_count=100";
+    var u = base + "/Location?near=" + nearParam(lat, lng, km) + "&_count=" + (radius > 16000 ? 400 : 100);
     return { url: u, bundle: parseBundle(await fetchText(u, 9000)) };
   }
-  var zips = zipsWithin(lat, lng, radius, zipCap(radius));
+  var zips = zipsWithin(lat, lng, radius, zipCap(radius), prof);
   if (!zips.length && zip) zips = [zip5(zip)];
   if (!zips.length) return { error: "no-zips" };
   if (geoMode === "postal-single") {
@@ -398,10 +421,13 @@ async function locationBundle(base, geoMode, lat, lng, km, radius, zip) {
     // centroid and crowd the residential ZIPs out of the nearest few, so sweep a LARGE set (50).
     // Empty ZIPs return instantly; we stop early once we have plenty. (Molina doesn't actually
     // rate-limit these single-ZIP Location reads hard - the old "2" was admin ZIPs + a name filter.)
-    var pick = zips.slice(0, 50);
+    // pick is in SPREAD order (one ZIP per direction/ring, then the next), so the early stop below
+    // leaves the whole area covered instead of only the ZIPs closest to the search point.
+    var pick = zips.slice(0, radius > 16000 ? 90 : 50);
     var entry = [], ci = 0;
+    var entryBudget = radius > 16000 ? 600 : 200;
     async function zipWorker() {
-      while (ci < pick.length && entry.length < 200) {
+      while (ci < pick.length && entry.length < entryBudget) {
         var z = pick[ci++];
         var b = await fetchText(base + "/Location?address-postalcode=" + encodeURIComponent(z) + "&_count=80", 7000).then(parseBundle).catch(function () { return null; });
         if (b && b.entry) entry = entry.concat(b.entry);
@@ -415,12 +441,11 @@ async function locationBundle(base, geoMode, lat, lng, km, radius, zip) {
   return { url: u2, zips: zips, bundle: parseBundle(await fetchText(u2, 9000)) };
 }
 
-async function locationSearch(base, geoMode, lat, lng, km, radius, type, zip, debug) {
-  var lb = await locationBundle(base, geoMode, lat, lng, km, radius, zip);
+async function locationSearch(base, geoMode, lat, lng, km, radius, type, zip, debug, prof) {
+  var lb = await locationBundle(base, geoMode, lat, lng, km, radius, zip, prof);
   if (lb.error) return { ok: false, reason: lb.error };
   if (!lb.bundle) return { ok: false, reason: "fhir-error", query: debug ? [lb.url] : undefined };
-  var maxM = radius * 1.1 + 400;
-  var places = bundleResources(lb.bundle, "Location").map(normLocation).filter(function (p) { return p && distM(lat, lng, p.lat, p.lng) <= maxM; });
+  var places = bundleResources(lb.bundle, "Location").map(normLocation).filter(function (p) { return p && REACH.withinReach(prof, radius, lat, lng, p.lat, p.lng); });
   // For a SPECIFIC care type (pharmacy/hospital/dentist/mental health) keep only matching places.
   // For the generic "clinic"/"doctor" location search, keep ALL in-network locations - everything
   // the plan's own directory returns is in-network, so a name that doesn't contain "clinic" is no
@@ -431,10 +456,11 @@ async function locationSearch(base, geoMode, lat, lng, km, radius, type, zip, de
   var seen = {}, out = [];
   places.forEach(function (p) { var k = (p.name || "") + "@" + p.lat.toFixed(4) + "," + p.lng.toFixed(4); if (seen[k]) return; seen[k] = 1; delete p._typeText; out.push(p); });
   out.sort(function (a, b) { return distM(lat, lng, a.lat, a.lng) - distM(lat, lng, b.lat, b.lng); });
-  return { ok: true, mode: "locations", type: type, radius: radius, approxByZip: out.some(function (p) { return p.approxByZip; }), count: out.length, places: out.slice(0, 250), query: debug ? [lb.url] : undefined };
+  var picked = capped(out, lat, lng, radius);
+  return { ok: true, mode: "locations", type: type, radius: radius, approxByZip: picked.some(function (p) { return p.approxByZip; }), count: out.length, returned: picked.length, places: picked, query: debug ? [lb.url] : undefined };
 }
 
-async function providerSearch(base, geoMode, lat, lng, km, radius, specialty, language, zip, debug) {
+async function providerSearch(base, geoMode, lat, lng, km, radius, specialty, language, zip, debug, prof) {
   var inc = "&_include=PractitionerRole:practitioner&_include=PractitionerRole:location&_include=PractitionerRole:organization";
   var queries = [], idx = {}, roles = [];
   var truncated = false;
@@ -444,7 +470,7 @@ async function providerSearch(base, geoMode, lat, lng, km, radius, specialty, la
     var p1 = await fetchPaged(u1, 6, 9000, Date.now() + 12000); truncated = truncated || p1.truncated;
     if (p1.entries.length) { var b1 = { entry: p1.entries }; indexBundle(b1, idx); roles = bundleResources(b1, "PractitionerRole"); }
   } else if (geoMode === "postal") {
-    var zips = zipsWithin(lat, lng, radius, zipCap(radius));
+    var zips = zipsWithin(lat, lng, radius, zipCap(radius), prof);
     if (!zips.length && zip) zips = [zip5(zip)];
     if (!zips.length) return { ok: false, reason: "no-zips" };
     var u2 = base + "/PractitionerRole?location.address-postalcode=" + encodeURIComponent(zips.join(",")) + inc + "&_count=500";
@@ -460,12 +486,14 @@ async function providerSearch(base, geoMode, lat, lng, km, radius, specialty, la
   // (location= returns 0), so don't waste a ZIP sweep here - the handler falls back to the
   // in-network LOCATION search, which is the best Molina supports.
   if (!roles.length && geoMode !== "postal-single") {
-    var lb = await locationBundle(base, geoMode, lat, lng, km, radius, zip);
+    var lb = await locationBundle(base, geoMode, lat, lng, km, radius, zip, prof);
     if (lb && lb.bundle) {
       indexBundle(lb.bundle, idx);
-      var locs = bundleResources(lb.bundle, "Location").map(function (l) { var co = coordsFor(l); return co ? { id: l.id, d: distM(lat, lng, co.lat, co.lng) } : null; }).filter(function (x) { return x && x.id && x.d <= radius * 1.1 + 400; });
+      var locs = bundleResources(lb.bundle, "Location").map(function (l) { var co = coordsFor(l); return co && REACH.withinReach(prof, radius, lat, lng, co.lat, co.lng) ? { id: l.id, lat: co.lat, lng: co.lng, d: distM(lat, lng, co.lat, co.lng) } : null; }).filter(function (x) { return x && x.id; });
       locs.sort(function (a, b) { return a.d - b.d; });
-      var ids = locs.slice(0, 40).map(function (x) { return x.id; });
+      // Spread the location cap over the area - the nearest 40 all sat on top of each other, so
+      // the providers we then looked up never reached the edge of a big reachable area.
+      var ids = REACH.spreadCap(locs, lat, lng, radius > 16000 ? 120 : 40).map(function (x) { return x.id; });
       if (ids.length) {
         var u3 = base + "/PractitionerRole?location=" + encodeURIComponent(ids.map(function (i) { return "Location/" + i; }).join(",")) + "&_include=PractitionerRole:practitioner&_include=PractitionerRole:organization&_count=500";
         queries.push(u3);
@@ -476,7 +504,6 @@ async function providerSearch(base, geoMode, lat, lng, km, radius, specialty, la
   }
   if (!roles.length) return { ok: false, reason: "no-providers", query: debug ? queries : undefined };
 
-  var maxM = radius * 1.1 + 400;
   // Dedupe by PROVIDER (one entry per doctor at their nearest location). L.A. Care lists the
   // same doctor at several placeholder "locations" with different ZIPs - this collapses those.
   // NOTE: we build the FULL set first (no specialty filter), so the specialty facet reflects the
@@ -492,7 +519,8 @@ async function providerSearch(base, geoMode, lat, lng, km, radius, specialty, la
     [].concat(pr.location || []).forEach(function (lref) {
       var loc = lref && lref.reference ? idx[lref.reference] : null; if (!loc) return;
       var co = coordsFor(loc); if (!co) return;
-      var d = distM(lat, lng, co.lat, co.lng); if (d > maxM) return;
+      if (!REACH.withinReach(prof, radius, lat, lng, co.lat, co.lng)) return;
+      var d = distM(lat, lng, co.lat, co.lng);
       var name = practName || cleanOrgName(loc.name) || "(In-network provider)";
       var lt = telOf(loc);
       var key = name.toLowerCase() + "|" + spec.toLowerCase();
@@ -505,16 +533,16 @@ async function providerSearch(base, geoMode, lat, lng, km, radius, specialty, la
   all.sort(function (a, b) { return distM(lat, lng, a.lat, a.lng) - distM(lat, lng, b.lat, b.lng); });
   var specialties = facetSpecialties(all);               // data-driven specialty chips for THIS plan
   var languagesAvail = facetLanguages(all);              // data-driven language chips for THIS plan
-  var out = all.filter(function (p) { return specSelected(p.specialty, specialty) && langSelected(p.languages, language); });
-  return { ok: true, mode: "providers", specialty: specialty, language: language, specialties: specialties, languagesAvail: languagesAvail, approxByZip: out.some(function (p) { return p.approxByZip; }), count: out.length, uniqueProviders: all.length, rolesScanned: roles.length, truncated: truncated, places: out.slice(0, 250), query: debug ? queries : undefined };
+  var matched = all.filter(function (p) { return specSelected(p.specialty, specialty) && langSelected(p.languages, language); });
+  var out = capped(matched, lat, lng, radius);
+  return { ok: true, mode: "providers", specialty: specialty, language: language, specialties: specialties, languagesAvail: languagesAvail, approxByZip: out.some(function (p) { return p.approxByZip; }), count: matched.length, returned: out.length, uniqueProviders: all.length, rolesScanned: roles.length, truncated: truncated, places: out, query: debug ? queries : undefined };
 }
 
 // Serve a preprocessed JSON dataset (Health Net's directory, or Kaiser's facilities).
 // ds.facilityOnly (Kaiser, a closed network): members get all care at these facilities, so
 // specialty/care-type filtering doesn't apply - return the nearest facilities for any search.
-function datasetSearch(ds, lat, lng, radius, type, specialty, language) {
+function datasetSearch(ds, lat, lng, radius, type, specialty, language, prof) {
   if (!ds || !Array.isArray(ds.records)) return { ok: false, reason: "no-dataset" };
-  var maxM = radius * 1.1 + 400;
   var facilityOnly = !!ds.facilityOnly;
   // Doctor/specialty search (provider records) vs a specific care-type (place) search.
   var wantDoctors = !facilityOnly && (type === "doctor" || !!specialty || !!language);
@@ -527,7 +555,7 @@ function datasetSearch(ds, lat, lng, radius, type, specialty, language) {
   var cand = [];
   for (var i = 0; i < ds.records.length; i++) {
     var r = ds.records[i];
-    if (!isFinite(r.lat) || !isFinite(r.lng) || distM(lat, lng, r.lat, r.lng) > maxM) continue;
+    if (!isFinite(r.lat) || !isFinite(r.lng) || !REACH.withinReach(prof, radius, lat, lng, r.lat, r.lng)) continue;
     if (facilityOnly) { cand.push(mk(r)); continue; }
     if (wantDoctors) {
       if (r.cat !== "doctor") continue;                       // provider records only (no language filter yet - facet first)
@@ -542,8 +570,9 @@ function datasetSearch(ds, lat, lng, radius, type, specialty, language) {
   // roster), and the selected ones filter the same way as the FHIR path.
   var specialties = wantDoctors ? facetSpecialties(cand) : [];
   var languagesAvail = wantDoctors ? facetLanguages(cand) : [];
-  var out = wantDoctors ? cand.filter(function (p) { return specSelected(p.specialty, specialty) && langSelected(p.languages, language); }) : cand;
-  return { ok: true, mode: facilityOnly ? "facilities" : (wantDoctors ? "providers" : "locations"), source: ds.plan === "kaiser" ? "kaiser" : "healthnet", facilityOnly: facilityOnly, specialties: specialties, languagesAvail: languagesAvail, approxByZip: !facilityOnly, refreshed: ds.generated || "", type: type, specialty: specialty, language: language, count: out.length, places: out.slice(0, 250) };
+  var matched = wantDoctors ? cand.filter(function (p) { return specSelected(p.specialty, specialty) && langSelected(p.languages, language); }) : cand;
+  var out = capped(matched, lat, lng, radius);
+  return { ok: true, mode: facilityOnly ? "facilities" : (wantDoctors ? "providers" : "locations"), source: ds.plan === "kaiser" ? "kaiser" : "healthnet", facilityOnly: facilityOnly, specialties: specialties, languagesAvail: languagesAvail, approxByZip: !facilityOnly, refreshed: ds.generated || "", type: type, specialty: specialty, language: language, count: matched.length, returned: out.length, places: out };
 }
 
 module.exports = async function handler(req, res) {
@@ -558,6 +587,9 @@ module.exports = async function handler(req, res) {
   var radius = parseInt(q.radius || "8047", 10) || 8047;
   radius = Math.min(Math.max(radius, 500), 48000); // up to ~30 mi - covers a 30-min drive isochrone
   var debug = String(q.debug || "") === "1";
+  // Optional radial profile of the client's reachable-area polygon (see api/_reach.js): searching
+  // the real travel-time shape instead of the circle around it is what fills in the far edges.
+  var prof = REACH.parseProfile(q.iso);
   if (!isFinite(lat) || !isFinite(lng)) { res.status(400).json({ ok: false, error: "Missing coordinates" }); return; }
 
   var cfg = (ENDPOINTS.plans || {})[plan];
@@ -566,7 +598,7 @@ module.exports = async function handler(req, res) {
   try {
     var result;
     if (cfg.dataset) {
-      result = datasetSearch(HN, lat, lng, radius, type, specialty, language);
+      result = datasetSearch(HN, lat, lng, radius, type, specialty, language, prof);
       result = Object.assign({ plan: plan }, result);
     } else {
       var base = String(cfg.baseUrl).replace(/\/+$/, "");
@@ -575,13 +607,13 @@ module.exports = async function handler(req, res) {
       // "Doctors" (type=doctor) uses provider mode with no specialty filter so EVERY in-network
       // doctor is returned and flagged - not just facility records (location mode = clinics).
       var wantProviders = !!(specialty || language || type === "doctor");
-      var r0 = wantProviders ? await providerSearch(base, geoMode, lat, lng, km, radius, specialty, language, zip, debug)
-                             : await locationSearch(base, geoMode, lat, lng, km, radius, type, zip, debug);
+      var r0 = wantProviders ? await providerSearch(base, geoMode, lat, lng, km, radius, specialty, language, zip, debug, prof)
+                             : await locationSearch(base, geoMode, lat, lng, km, radius, type, zip, debug, prof);
       // If provider/specialty mode returned nothing (some directories - IEHP, Molina - can't
       // filter PractitionerRole by location via the API), fall back to in-network LOCATIONS so
       // the map still shows in-network places to call.
       if (wantProviders && (!r0.ok || !r0.places || !r0.places.length)) {
-        var rl = await locationSearch(base, geoMode, lat, lng, km, radius, "clinic", zip, debug);
+        var rl = await locationSearch(base, geoMode, lat, lng, km, radius, "clinic", zip, debug, prof);
         if (rl.ok && rl.places && rl.places.length) { rl.specialtyUnavailable = true; r0 = rl; }
       }
       result = Object.assign({ source: "fhir", plan: plan, geo: geoMode, refreshed: "live" }, r0);
