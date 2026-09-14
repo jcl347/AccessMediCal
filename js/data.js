@@ -1,7 +1,7 @@
 /* AUTO-GENERATED from /data by scripts/build-data.mjs - do not edit by hand. */
 window.AM_DATA = {
   "meta": {
-    "lastUpdated": "2026-09-07",
+    "lastUpdated": "2026-09-14",
     "region": "Greater Los Angeles, California",
     "county": "Los Angeles County",
     "h1Note": ""
